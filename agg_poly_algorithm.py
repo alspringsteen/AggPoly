@@ -51,10 +51,10 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 	This algorithm aggregates polygons within a certain distance and 
 	taking barriers into account.
 	
-	The new features are build up from all valid triangles of 
+	The returned features are build up from all valid triangles of 
 	the input (polygon-) vertices.
-	Only those triangles within a certain distance and disjoint from
-	the barrier features are valid.
+	Only those triangles with all segments shorter than the chosen distance 
+	and disjoint from the barrier features are valid.
 	"""
 	
 	# Constants used to refer to parameters and outputs. 
@@ -63,6 +63,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 	SEARCH_DIST = 'SEARCH_DIST'
 	DISSOLVE_WITH_INPUT = 'DISSOLVE_WITH_INPUT'
 	BARRIER = 'BARRIER'
+	SIMPLIFY_DIST = 'SIMPLIFY_DIST'
 	
 	# SQL Dict
 	# TODO: use native spatialindex
@@ -72,6 +73,12 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		
 		"import":
 			"CREATE TABLE '{0}' AS SELECT * FROM named_sqlite.{0};",
+
+		"simplify_and_segmentize":
+			"UPDATE pol_layer SET geometry = st_segmentize(st_simplify(geometry,{simplify}),{segmentize});",
+
+		"segmentize_only":
+			"UPDATE pol_layer SET geometry = st_segmentize(geometry, {0});",
 		
 		"enable_spatialite":
 			"SELECT load_extension('mod_spatialite'); \
@@ -217,7 +224,18 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 			QgsProcessingParameterDistance(
 				self.SEARCH_DIST,
 				self.tr('Distance for aggregation'),
-				500
+				500,
+				'INPUT'
+			)
+		)
+
+		# Add SIMPLIFY_DIST
+		self.addParameter(
+			QgsProcessingParameterDistance(
+				self.SIMPLIFY_DIST,
+				self.tr('Simplify input polygons (reduces processing time)'),
+				1,
+				'INPUT'
 			)
 		)
 
@@ -242,7 +260,9 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		
 		barrier = self.parameterAsLayer(parameters, self.BARRIER, context)
 
-		search_dist = self.parameterAsInt(parameters, self.SEARCH_DIST, context)
+		search_dist = self.parameterAsDouble(parameters, self.SEARCH_DIST, context)
+
+		simplify_dist = self.parameterAsDouble(parameters, self.SIMPLIFY_DIST, context)
 
 		dissolve_with_input = self.parameterAsBoolean(parameters, self.DISSOLVE_WITH_INPUT, context)
 		
@@ -264,8 +284,6 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		#total = 100.0 / source.featureCount() if source.featureCount() else 0
 		#features = source.getFeatures()
 		
-		# TODO: simplyfy
-		# TODO: segmetize
 		# TODO: more exception handling
 		# TODO: more robust
 		# TODO: more feedback.isCanceled() checks
@@ -299,11 +317,18 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		# TODO: use self.tr # Datenbank angelegt und Layer geladen.
 		feedback.pushInfo("Database created and features imported.")
 		
-		# Do a lot in SQLite
+		### Do a lot in SQLite
 		# TODO: # Lege neue Tabellen an und berechne Distanzen.
 		feedback.pushInfo("Create new tables and calculate distances.")
 		cur.execute(self.sql["attach"].format(named_sqlite_uri))
 		cur.execute(self.sql["import"].format("pol_layer"))
+		# simplify: less vertices reduces processing time
+		# segmentize: ensure enough vertices
+		if simplify_dist > 0:
+			cur.execute(self.sql["simplify_and_segmentize"].format(segmentize = search_dist, simplify = simplify_dist))
+		else:
+			pass
+			#cur.execute(self.sql["segmentize_only"].format(search_dist))
 		if not barrier is None:
 			cur.execute(self.sql["import"].format("barrier_layer"))
 		else: # TODO
@@ -319,6 +344,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		cur.execute(self.sql["c_join_intersec"])
 		n_poi = cur.execute(self.sql["s_n_points"]).fetchall()[0][0]
 		cur.execute(self.sql["c_res"])
+		###
 
 		# TODO: Alle notwendigen Tabellen angelegt.
 		feedback.pushInfo("Tables created.")
@@ -382,7 +408,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		singleparts = processing.run("native:multiparttosingleparts", {'INPUT': dissolved['OUTPUT'], 'OUTPUT': 'memory:'})
 		###
 
-		# Copy features to sink
+		### Copy features to sink
 		# TODO: how to write directly from processing algorithm native:multiparttosinglepart to sink?
 		feedback.pushInfo("Copy features to output.")
 		
@@ -397,6 +423,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 			
 			# TODO: Update the progress bar
 			#feedback.setProgress(int(current * total))
+		###
 
 		# Return the results of the algorithm.
 		return {self.OUTPUT: dest_id}
