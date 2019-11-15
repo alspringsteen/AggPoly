@@ -38,6 +38,7 @@ from qgis.core import (QgsProcessing,
 					   QgsProcessingParameterFeatureSink,
 					   QgsProcessingParameterNumber,
 					   QgsProcessingParameterDistance,
+					   QgsProcessingParameterBoolean,
 					   QgsFields,
 					   QgsDataSourceUri)
 import sqlite3
@@ -60,6 +61,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 	OUTPUT = 'OUTPUT'
 	INPUT = 'INPUT'
 	SEARCH_DIST = 'SEARCH_DIST'
+	DISSOLVE_WITH_INPUT = 'DISSOLVE_WITH_INPUT'
 	BARRIER = 'BARRIER'
 	
 	# SQL Dict
@@ -219,6 +221,15 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 			)
 		)
 
+		# Add DISSOLVE_WITH_INPUT
+		self.addParameter(
+			QgsProcessingParameterBoolean(
+				self.DISSOLVE_WITH_INPUT,
+				self.tr('Dissolve result with input layer'),
+				True
+			)
+		)
+
 	def processAlgorithm(self, parameters, context, feedback):
 		"""
 		Here is where the processing itself takes place.
@@ -228,12 +239,15 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		# to uniquely identify the feature sink, and must be included in the
 		# dictionary returned by the processAlgorithm function.
 		source = self.parameterAsSource(parameters, self.INPUT, context)
+		source_layer = self.parameterAsLayer(parameters, self.INPUT, context)
 		source_uri = self.parameterAsString(parameters, self.INPUT, context)
 		
 		barrier = self.parameterAsSource(parameters, self.BARRIER, context)
 		barrier_uri = self.parameterAsString(parameters, self.BARRIER, context)
 
 		search_dist = self.parameterAsInt(parameters, self.SEARCH_DIST, context)
+
+		dissolve_with_input = self.parameterAsBoolean(parameters, self.DISSOLVE_WITH_INPUT, context)
 		
 		(sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
 				context, QgsFields(), source.wkbType(), source.sourceCrs())
@@ -345,19 +359,32 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		
 		con_n.close()
 		con_m.close()
-
-		# TODO: dissolve features
-		# TODO: merge with source	
 		
-		# Copy features to sink
+		# create result-QgsVectorLayer 
 		named_sqlite_result_uri = QgsDataSourceUri()
 		named_sqlite_result_uri.setDatabase(named_sqlite_uri)
 		named_sqlite_result_uri.setDataSource('', 'pol_res', 'geom')
 		named_sqlite_result = QgsVectorLayer(named_sqlite_result_uri.uri(), providerLib='spatialite')
 
+		### post-processing
+		# which features should be dissolved	
+		if dissolve_with_input:
+			do_be_dissolved = processing.run("native:mergevectorlayers", {'LAYERS': [named_sqlite_result, source_layer], 'OUTPUT': 'memory:'})
+		else:
+			do_be_dissolved = {'OUTPUT': named_sqlite_result}
+
+		# dissolve features
+		dissolved = processing.run("native:dissolve", {'INPUT': do_be_dissolved['OUTPUT'], 'OUTPUT': 'memory:'})
+
+		# singlepart features
+		singleparts = processing.run("native:multiparttosingleparts", {'INPUT': dissolved['OUTPUT'], 'OUTPUT': 'memory:'})
+		###
+
+		# Copy features to sink
+		# TODO: how to write directly from processing algorithm native:multiparttosinglepart to sink?
 		feedback.pushInfo("Copy features to output.")
 		
-		result_features = named_sqlite_result.getFeatures()
+		result_features = singleparts['OUTPUT'].getFeatures()
 		for current, feature in enumerate(result_features):
 			# Stop the algorithm if cancel button has been clicked
 			if feedback.isCanceled():
@@ -370,7 +397,6 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 			#feedback.setProgress(int(current * total))
 
 		# Return the results of the algorithm.
-		
 		return {self.OUTPUT: dest_id}
 
 	def name(self):
