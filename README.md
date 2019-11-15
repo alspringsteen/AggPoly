@@ -3,7 +3,7 @@ AggPoly (aggregate polygons) is a QGIS3-Plugin for aggregation and generalizatio
 The algorithm takes a polygon and optional barrier layer (of any geometry type) and returns features that link areas, which are within the specified distance. If a barrier layer is chosen, the new features don't cross the features of the barrier layer.
 
 ## Example
-[example image](example.jpeg)
+![example image](example.jpeg)
 
 ## Performance
 The algorithm relies on polygon vertices.
