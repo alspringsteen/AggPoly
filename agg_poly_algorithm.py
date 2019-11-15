@@ -34,7 +34,7 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
 					   QgsFeatureSink,
 					   QgsProcessingAlgorithm,
-					   QgsProcessingParameterFeatureSource,
+					   QgsProcessingParameterVectorLayer,
 					   QgsProcessingParameterFeatureSink,
 					   QgsProcessingParameterNumber,
 					   QgsProcessingParameterDistance,
@@ -184,7 +184,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 
 		# We add the input vector features source. 
 		self.addParameter(
-			QgsProcessingParameterFeatureSource(
+			QgsProcessingParameterVectorLayer(
 				self.INPUT,
 				self.tr('Input layer'),
 				[QgsProcessing.TypeVectorPolygon]
@@ -204,7 +204,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		# Add barrier source. It can have any kind of
 		# geometry.
 		self.addParameter(
-			QgsProcessingParameterFeatureSource(
+			QgsProcessingParameterVectorLayer(
 				self.BARRIER,
 				self.tr('Barrier layer'),
 				[QgsProcessing.TypeVectorAnyGeometry],
@@ -238,12 +238,9 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		# Retrieve the feature source and sink. The 'dest_id' variable is used
 		# to uniquely identify the feature sink, and must be included in the
 		# dictionary returned by the processAlgorithm function.
-		source = self.parameterAsSource(parameters, self.INPUT, context)
-		source_layer = self.parameterAsLayer(parameters, self.INPUT, context)
-		source_uri = self.parameterAsString(parameters, self.INPUT, context)
+		source = self.parameterAsLayer(parameters, self.INPUT, context)
 		
-		barrier = self.parameterAsSource(parameters, self.BARRIER, context)
-		barrier_uri = self.parameterAsString(parameters, self.BARRIER, context)
+		barrier = self.parameterAsLayer(parameters, self.BARRIER, context)
 
 		search_dist = self.parameterAsInt(parameters, self.SEARCH_DIST, context)
 
@@ -260,7 +257,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 			epsg_inuse = barrier.sourceCrs().authid()
 		else:
 			pass
-			#TODO: stop
+			#TODO: raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT))
 		
 		# Compute the number of steps to display within the progress bar and
 		# get features from source
@@ -293,11 +290,11 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		
 		# import INPUTs in spatialite
 		# TODO: accept shapefiles with mixed single- and multipart-features
-		#source_single = processing.run("native:multiparttosingleparts", {'INPUT': source_uri, 'OUTPUT': 'memory'})
+		#source_single = processing.run("native:multiparttosingleparts", {'INPUT': source, 'OUTPUT': 'memory'})
 		
-		processing.run("qgis:importintospatialite", {'INPUT': source_uri, 'DATABASE': named_sqlite, 'TABLENAME': 'pol_layer', 'GEOMETRY_COLUMN': 'geometry', 'CREATEINDEX': True, 'FORCE_SINGLEPART': True})
+		processing.run("qgis:importintospatialite", {'INPUT': source, 'DATABASE': named_sqlite, 'TABLENAME': 'pol_layer', 'GEOMETRY_COLUMN': 'geometry', 'CREATEINDEX': True, 'FORCE_SINGLEPART': True})
 		if not barrier is None:
-			processing.run("qgis:importintospatialite", {'INPUT': barrier_uri, 'DATABASE': named_sqlite, 'TABLENAME': 'barrier_layer', 'GEOMETRY_COLUMN': 'geometry', 'CREATEINDEX': True, 'FORCE_SINGLEPART': True})
+			processing.run("qgis:importintospatialite", {'INPUT': barrier, 'DATABASE': named_sqlite, 'TABLENAME': 'barrier_layer', 'GEOMETRY_COLUMN': 'geometry', 'CREATEINDEX': True, 'FORCE_SINGLEPART': True})
 		
 		# TODO: use self.tr # Datenbank angelegt und Layer geladen.
 		feedback.pushInfo("Database created and features imported.")
@@ -337,7 +334,12 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		# TODO: # Beginne Dreiecks-Berechnung.
 		feedback.pushInfo("Building polygons ...")
 		
+		# TODO: multi-threading
 		for p in range(1, n_poi + 1):
+			# Stop the algorithm if cancel button has been clicked
+			if feedback.isCanceled():
+				break
+
 			cur.execute(self.sql["c_subset_view"].format(p))
 			cur.execute(self.sql["c_triangles"].format(p))
 			#cur.execute("SELECT RecoverGeometryColumn('triangles_sel', 'triangle', {}, 'POLYGON', 'XY');".format(epsg_inuse.split(":")[1]))
@@ -369,7 +371,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		### post-processing
 		# which features should be dissolved	
 		if dissolve_with_input:
-			do_be_dissolved = processing.run("native:mergevectorlayers", {'LAYERS': [named_sqlite_result, source_layer], 'OUTPUT': 'memory:'})
+			do_be_dissolved = processing.run("native:mergevectorlayers", {'LAYERS': [named_sqlite_result, source], 'OUTPUT': 'memory:'})
 		else:
 			do_be_dissolved = {'OUTPUT': named_sqlite_result}
 
@@ -388,7 +390,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		for current, feature in enumerate(result_features):
 			# Stop the algorithm if cancel button has been clicked
 			if feedback.isCanceled():
-				break
+				return None
 			
 			# Add a feature in the sink
 			sink.addFeature(feature, QgsFeatureSink.FastInsert)
