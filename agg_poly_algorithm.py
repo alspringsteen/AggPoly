@@ -9,7 +9,7 @@
 							  -------------------
 		begin				: 2019-11-06
 		copyright			: (C) 2019 by Friedrich Viedt
-		email				: ***REMOVED***
+		email				: 57571099+fiedt@users.noreply.github.com
  ***************************************************************************/
 
 /***************************************************************************
@@ -40,10 +40,12 @@ from qgis.core import (QgsProcessing,
 					   QgsProcessingParameterDistance,
 					   QgsProcessingParameterBoolean,
 					   QgsFields,
-					   QgsDataSourceUri)
+					   QgsDataSourceUri,
+					   QgsProcessingException)
 import sqlite3
 from qgis.core import QgsProcessingUtils, QgsVectorLayer
 import processing
+from time import sleep
 
 
 class AggPolyAlgorithm(QgsProcessingAlgorithm):
@@ -66,121 +68,157 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 	SIMPLIFY_DIST = 'SIMPLIFY_DIST'
 	
 	# SQL Dict
-	# TODO: use native spatialindex
-	sql = {
-		"attach":
-			"ATTACH '{0}' AS named_sqlite;",
-		
+	# TODO: test st_relate performance
+	sql = {		
 		"import":
-			"CREATE TABLE '{0}' AS SELECT * FROM named_sqlite.{0};",
+			"""
+			CREATE TABLE {0} AS 
+				SELECT t.id AS id, CastToXY(e.geometry) AS geometry 
+				FROM named_sqlite.{0} t
+				JOIN ElementaryGeometries AS e ON (e.db_prefix = 'named_sqlite' AND e.f_table_name = '{0}' AND e.f_geometry_column = 'geometry' AND e.origin_rowid = t.rowid);
+			""",
+
+		"get_invalid_geometry":
+			"""
+			SELECT rowid FROM {table} WHERE NOT isValid({column});
+			""",
+
+		"drop_invalid_geometry":
+			"""
+			DELETE FROM {table} WHERE NOT isValid({column});
+			""",
 
 		"simplify_and_segmentize":
-			"UPDATE pol_layer SET geometry = st_segmentize(st_simplify(geometry,{simplify}),{segmentize});",
+			"""
+			UPDATE pol_layer SET geometry = st_segmentize(st_simplify(geometry,{simplify}),{segmentize});
+			""",
 
 		"segmentize_only":
-			"UPDATE pol_layer SET geometry = st_segmentize(geometry, {0});",
+			"""
+			UPDATE pol_layer SET geometry = st_segmentize(geometry, {0});
+			""",
+
+		"simplify_only":
+			"""
+			UPDATE {table} SET geometry = st_simplify(geometry, {simplify});
+			""",
 		
 		"enable_spatialite":
-			"SELECT load_extension('mod_spatialite'); \
-			SELECT InitSpatialMetaData(1);",
+			"""
+			SELECT load_extension('mod_spatialite'); 
+			SELECT InitSpatialMetaData(1);
+			""",
 		
 		"c_empty_table":
-			"CREATE TABLE {0};",
-			
-		"c_polygon_bb":
-			"CREATE TABLE pol_layer_bb AS \
-			SELECT pol_layer.id AS id, pol_layer.geometry AS pol_geom, BuildMbr(index_tab.xmin, index_tab.ymin, index_tab.xmax, index_tab.ymax, {}) AS bb \
-			FROM pol_layer, idx_pol_layer_geometry AS index_tab \
-			WHERE pol_layer.id = index_tab.pkid;",
-			
+			"""
+			CREATE TABLE {0};
+			""",
+
 		"c_polygon_distance":
-			"CREATE TABLE pol_dist AS SELECT * FROM \
-			(SELECT pol1.id AS pols_id, pol1.pol_geom AS pols_geom, pol2.id AS polt_id, pol2.pol_geom AS polt_geom \
-			FROM pol_layer_bb AS pol1, pol_layer_bb AS pol2 \
-			WHERE pol1.id <= pol2.id AND ST_Distance(pol1.bb, pol2.bb) <= {0}) \
-			WHERE ST_Distance(pols_geom, polt_geom) <= {0};",
-			
-		"c_polygon_vertexes":
-			"CREATE TABLE multipoints AS \
-			SELECT *, NumGeometries(mpoi_geom) AS n_poi FROM \
-			(SELECT pol.id, DissolvePoints(pol.pol_geom) AS mpoi_geom \
-			FROM pol_layer_bb AS pol);",
-		
-		"s_max_n_mpoi":
-			"SELECT MAX(n_poi) FROM multipoints;",
-			
-			"c_helper_t":
-			"CREATE TABLE numbers AS \
-			WITH RECURSIVE \
-				cnt(x) AS ( \
-					SELECT 1 \
-					UNION ALL \
-					SELECT x+1 FROM cnt \
-					LIMIT {}) \
-			SELECT x FROM cnt;",
-		
+			"""
+			CREATE TABLE pol_dist AS 
+				SELECT pol1.id AS pols_id, pol1.geometry AS pols_geom, pol2.id AS polt_id, pol2.geometry AS polt_geom FROM pol_layer pol1, pol_layer pol2
+					WHERE 
+						pol1.id <= pol2.id AND
+						ST_Distance(pols_geom, polt_geom) <= {0} AND
+						pol1.ROWID IN (SELECT ROWID FROM SpatialIndex WHERE f_table_name = 'pol_layer' AND search_frame = buffer(pol2.geometry, {0}));
+			""",
+
+		"dissolve_points":
+			"""
+			ALTER TABLE pol_layer ADD COLUMN mpoi_geom;
+			UPDATE pol_layer SET mpoi_geom = DissolvePoints(geometry);
+			""",
+
 		"c_points":
-			"CREATE TABLE points AS \
-			SELECT \
-				id AS pol_id, \
-				GeometryN(mpoi_geom, numbers.x) AS poi_geom \
-			FROM \
-				multipoints JOIN numbers \
-				ON numbers.x <= n_poi;",
-		
+			"""
+			CREATE TABLE points AS 
+				SELECT t.rowid AS pol_id, e.geometry AS poi_geom
+				FROM pol_layer AS t
+				JOIN ElementaryGeometries AS e ON (e.f_table_name = 'pol_layer' AND e.f_geometry_column = 'mpoi_geom' AND e.origin_rowid = t.rowid);
+			""",
+
 		"c_line":
-			"CREATE TABLE poi_to_poi AS \
-			SELECT p1.rowid AS pois_id, pols_id, polt_id, p2.rowid AS poit_id, MakeLine(p1.poi_geom, p2.poi_geom) AS l_geom \
-			FROM points p1 \
-			JOIN pol_dist d1 ON p1.pol_id = d1.pols_id \
-			JOIN points p2 ON d1.polt_id = p2.pol_id \
-			WHERE ST_Distance(p1.poi_geom, p2.poi_geom) <= {} AND ST_Distance(p1.poi_geom, p2.poi_geom) > 0;",
+			"""
+			CREATE TABLE poi_to_poi AS 
+				SELECT p1.rowid AS pois_id, pols_id, polt_id, p2.rowid AS poit_id, MakeLine(p1.poi_geom, p2.poi_geom) AS l_geom 
+				FROM points p1 
+				JOIN pol_dist d1 ON p1.pol_id = d1.pols_id 
+				JOIN points p2 ON d1.polt_id = p2.pol_id 
+				WHERE ST_Distance(p1.poi_geom, p2.poi_geom) <= {} 
+					AND ST_Distance(p1.poi_geom, p2.poi_geom) > 0;
+			""",
 			
 		"c_intersec_lines":
-			"CREATE TABLE intersec_lines AS \
-			SELECT poi_to_poi.rowid AS poi_id, ST_Intersects(poi_to_poi.l_geom, barrier_layer.geometry) AS intersec \
-			FROM poi_to_poi, barrier_layer \
-			WHERE intersec",
-			
+			"""
+			CREATE TABLE intersec_lines AS 
+				SELECT poi_to_poi.rowid AS poi_id, 1 AS intersec 
+				FROM poi_to_poi, barrier_layer 
+				WHERE ST_Crosses(poi_to_poi.l_geom, barrier_layer.geometry)
+					AND poi_to_poi.ROWID IN (SELECT ROWID FROM SpatialIndex WHERE f_table_name = 'poi_to_poi' AND search_frame = barrier_layer.geometry);
+			""",
+		
 		"c_join_intersec":
-			"CREATE TABLE poi_to_poi_no_intersec AS \
-			SELECT poi_to_poi.* FROM poi_to_poi \
-			LEFT JOIN intersec_lines ON poi_to_poi.rowid = intersec_lines.poi_id \
-			WHERE intersec_lines.intersec IS NULL",
+			"""
+			CREATE TABLE poi_to_poi_no_intersec AS 
+				SELECT poi_to_poi.* FROM poi_to_poi 
+				LEFT JOIN intersec_lines ON poi_to_poi.rowid = intersec_lines.poi_id 
+				WHERE intersec_lines.intersec IS NULL;
+			""",
 		
 		"s_n_points":
-			"SELECT COUNT(rowid) FROM points",
+			"""
+			SELECT COUNT(rowid) FROM points
+			""",
 		
 		"c_res":
-			"CREATE TABLE named_sqlite.pol_res ( \
-			poi INT, \
-			geom GEOMETRY);",
+			"""
+			CREATE TABLE named_sqlite.pol_res ( 
+			poi INT, 
+			geom GEOMETRY);
+			""",
 		
-		"c_subset_view":
-			"CREATE VIEW poi_sel AS \
-			SELECT * FROM poi_to_poi_no_intersec \
-			WHERE pois_id = {};",
+		"c_view":
+			"""
+			CREATE VIEW poi_sel AS 
+				SELECT * FROM poi_to_poi_no_intersec 
+				WHERE pois_id = {0};
+			""",
 		
 		"c_triangles":
-			"CREATE TABLE triangles_sel AS \
-			SELECT {} AS poi, BuildArea(Collect(Collect(p12.l_geom, p23.l_geom), p13.l_geom)) AS triangle \
-			FROM poi_sel p12 INNER JOIN poi_to_poi_no_intersec p23 \
-			ON p12.poit_id = p23.pois_id INNER JOIN poi_sel p13 \
-			ON p23.poit_id = p13.poit_id;",
-		
+			"""
+			CREATE TABLE triangles_sel AS 
+				SELECT {0} AS poi, BuildArea(Collect(Collect(p12.l_geom, p23.l_geom), p13.l_geom)) AS triangle 
+				FROM poi_sel p12 
+				INNER JOIN poi_to_poi_no_intersec p23 ON p12.poit_id = p23.pois_id 
+				INNER JOIN poi_sel p13 ON p23.poit_id = p13.poit_id;
+			""",
+
 		"i_subset_res":
-			"INSERT INTO pol_res (poi, geom) \
-			SELECT poi, CastToMultiPolygon(ST_Union(triangle)) as geom \
-			FROM triangles_sel \
-			GROUP BY poi;",
-		
-		"d_subset_t":
-			"DROP VIEW poi_sel; \
-			DROP TABLE triangles_sel;",
+			"""
+			INSERT INTO pol_res (poi, geom) 
+				SELECT poi, CastToMultiPolygon(ST_Union(triangle)) as geom 
+				FROM triangles_sel
+				WHERE NOT triangles_sel.ROWID IN (
+					SELECT triangles_sel.ROWID 
+					FROM triangles_sel, barrier_layer
+					WHERE (ST_Within(triangles_sel.triangle, barrier_layer.geometry) OR ST_Within(barrier_layer.geometry, triangles_sel.triangle))
+						AND barrier_layer.ROWID IN (
+							SELECT ROWID FROM SpatialIndex WHERE f_table_name = 'barrier_layer' AND search_frame = triangles_sel.triangle
+							)
+				);
+			""",
 		
 		"recover_spatial":
-			"SELECT RecoverGeometryColumn({0}, {1}, {2}, 'MULTIPOLYGON', 'XY'); \
-			SELECT CreateSpatialIndex({0}, {1});"
+			"""
+			SELECT RecoverGeometryColumn('{table}', '{column}', {crs}, '{geometrytype}', 'XY'); 
+			SELECT CreateSpatialIndex('{table}', '{column}');
+			""",
+
+		"get_geometrytype":
+			"""
+			SELECT st_geometrytype({column}) FROM {table} LIMIT 1;
+			"""
 			}
 
 	def initAlgorithm(self, config):
@@ -248,6 +286,13 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 			)
 		)
 
+	# TODO: use GeoDB class
+	def getSpatialConnetion (self, connect_to):
+		con = sqlite3.connect(connect_to)
+		con.enable_load_extension(True)
+		con.executescript(self.sql["enable_spatialite"])
+		return con
+
 	def processAlgorithm(self, parameters, context, feedback):
 		"""
 		Here is where the processing itself takes place.
@@ -269,47 +314,28 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		(sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
 				context, QgsFields(), source.wkbType(), source.sourceCrs())
 		
-		# Check for identical EPSG Code
-
+		# Check for identical CRS
 		if barrier is None:
-			epsg_inuse = source.sourceCrs().authid()
+			(epsg, srid) = source.sourceCrs().authid().split(":")
 		elif source.sourceCrs().authid() == barrier.sourceCrs().authid():
-			epsg_inuse = barrier.sourceCrs().authid()
+			(epsg, srid) = barrier.sourceCrs().authid().split(":")
 		else:
-			pass
-			#TODO: raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT))
+			raise QgsProcessingException(self.tr("Inputs in different CRS are not supported!"))
+		assert epsg == "EPSG"
 		
-		# Compute the number of steps to display within the progress bar and
-		# get features from source
-		#total = 100.0 / source.featureCount() if source.featureCount() else 0
-		#features = source.getFeatures()
-		
-		# TODO: more exception handling
-		# TODO: more robust
+		# TODO: more exception handling, more robust
 		# TODO: more feedback.isCanceled() checks
 		
-		# generate named spatialite-db and connect
-		named_sqlite_uri = QgsProcessingUtils.generateTempFilename("aggPoly.sqlite")
-		named_sqlite = QgsVectorLayer(named_sqlite_uri)
-		# reference: https://github.com/qgis/QGIS/commit/6402160526e3176d1d41f422d6ecab59aa7ac68d
-		con_n = sqlite3.connect(named_sqlite_uri)
-		con_n.enable_load_extension(True)
-		con_n.executescript(self.sql["enable_spatialite"])
+		# connect to named spatialite-db and memory spatialite-db
+		named_sqlite_path = QgsProcessingUtils.generateTempFilename("aggPoly.sqlite")
+		named_sqlite = QgsVectorLayer(named_sqlite_path)
+		con_n = self.getSpatialConnetion(named_sqlite_path)
+		con_m = self.getSpatialConnetion(':memory:')
 		
-		# generate memory spatialite-db
-		# TODO: only if requested / not mandatory if named_sqlite_uri returns a path in TMPFS
-		con_m = sqlite3.connect(':memory:')
-		con_m.enable_load_extension(True)
-		con_m.executescript(self.sql["enable_spatialite"])
-		
-		# TODO: only if memory-db requested
-		#cur = con_n.cursor()
+		# create cursor
 		cur = con_m.cursor()
 		
 		# import INPUTs in spatialite
-		# TODO: accept shapefiles with mixed single- and multipart-features
-		#source_single = processing.run("native:multiparttosingleparts", {'INPUT': source, 'OUTPUT': 'memory'})
-		
 		processing.run("qgis:importintospatialite", {'INPUT': source, 'DATABASE': named_sqlite, 'TABLENAME': 'pol_layer', 'GEOMETRY_COLUMN': 'geometry', 'CREATEINDEX': True, 'FORCE_SINGLEPART': True})
 		if not barrier is None:
 			processing.run("qgis:importintospatialite", {'INPUT': barrier, 'DATABASE': named_sqlite, 'TABLENAME': 'barrier_layer', 'GEOMETRY_COLUMN': 'geometry', 'CREATEINDEX': True, 'FORCE_SINGLEPART': True})
@@ -317,47 +343,44 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		# TODO: use self.tr # Datenbank angelegt und Layer geladen.
 		feedback.pushInfo("Database created and features imported.")
 		
-		### Do a lot in SQLite
-		# TODO: # Lege neue Tabellen an und berechne Distanzen.
+		### Execute SQL
 		feedback.pushInfo("Create new tables and calculate distances.")
-		cur.execute(self.sql["attach"].format(named_sqlite_uri))
+		cur.execute("""ATTACH '{}' AS named_sqlite;""".format(named_sqlite_path))
 		cur.execute(self.sql["import"].format("pol_layer"))
+		if not barrier is None:
+			cur.execute(self.sql["import"].format("barrier_layer"))
+			geomtype_barrier_layer = cur.execute(self.sql["get_geometrytype"].format(column = "geometry", table = "barrier_layer")).fetchall()[0][0]
+		else: # TODO
+			cur.execute("""CREATE TABLE barrier_layer (geometry BLOB);""")
+			geomtype_barrier_layer = 'POLYGON' # Dummy
+		
 		# simplify: less vertices reduces processing time
 		# segmentize: ensure enough vertices
 		if simplify_dist > 0:
 			cur.execute(self.sql["simplify_and_segmentize"].format(segmentize = search_dist, simplify = simplify_dist))
+			cur.execute(self.sql["simplify_only"].format(table = "barrier_layer", simplify = simplify_dist)) 
 		else:
-			pass
-			#cur.execute(self.sql["segmentize_only"].format(search_dist))
-		if not barrier is None:
-			cur.execute(self.sql["import"].format("barrier_layer"))
-		else: # TODO
-			cur.execute("""CREATE TABLE barrier_layer (geometry BLOB);""")
-		cur.execute(self.sql["c_polygon_bb"].format(epsg_inuse.split(":")[1]))
+			cur.execute(self.sql["segmentize_only"].format(search_dist))
+		# drop invalid geometries and recover spatialindex
+		cur.execute(self.sql["drop_invalid_geometry"].format(table = "barrier_layer", column = "geometry")) 
+		cur.executescript(self.sql["recover_spatial"].format(table = "barrier_layer", column = "geometry", crs = srid, geometrytype = geomtype_barrier_layer))
+		cur.execute(self.sql["drop_invalid_geometry"].format(table = "pol_layer", column = "geometry")) 
+		geomtype_pol_layer = cur.execute(self.sql["get_geometrytype"].format(column = "geometry", table = "pol_layer")).fetchall()[0][0]
+		cur.executescript(self.sql["recover_spatial"].format(table = "pol_layer", column = "geometry", crs = srid, geometrytype = geomtype_pol_layer))
+		
 		cur.execute(self.sql["c_polygon_distance"].format(search_dist))
-		cur.execute(self.sql["c_polygon_vertexes"])
-		max_n_mpoi = cur.execute(self.sql["s_max_n_mpoi"]).fetchall()[0][0]
-		cur.execute(self.sql["c_helper_t"].format(max_n_mpoi))
+		cur.executescript(self.sql["dissolve_points"])
+		cur.executescript(self.sql["recover_spatial"].format(table = "pol_layer", column = "mpoi_geom", crs = srid, geometrytype = "MULTIPOINT"))
 		cur.execute(self.sql["c_points"])
 		cur.execute(self.sql["c_line"].format(search_dist))
+		cur.executescript(self.sql["recover_spatial"].format(table = "poi_to_poi", column = "l_geom", crs = srid, geometrytype = "LINESTRING"))
 		cur.execute(self.sql["c_intersec_lines"])
 		cur.execute(self.sql["c_join_intersec"])
 		n_poi = cur.execute(self.sql["s_n_points"]).fetchall()[0][0]
 		cur.execute(self.sql["c_res"])
 		###
 
-		# TODO: Alle notwendigen Tabellen angelegt.
-		feedback.pushInfo("Tables created.")
-
-		# TODO: test st_relate performance
-		sql_dinters = "CREATE TABLE triangles_nointers AS \
-			SELECT triangles_sel.poi AS poi, triangles_sel.triangle AS triangle\
-			FROM triangles_sel, barrier_layer\
-			WHERE NOT ST_Overlaps(triangles_sel.triangle, barrier_layer.geometry) AND NOT ST_Within(triangles_sel.triangle, barrier_layer.geometry);"
-		
-		sql_dtriint = "DROP TABLE triangles_nointers;"
-
-		# TODO: # Beginne Dreiecks-Berechnung.
+		feedback.pushInfo("Tables created and distances calculated.")
 		feedback.pushInfo("Building polygons ...")
 		
 		# TODO: multi-threading
@@ -366,14 +389,11 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 			if feedback.isCanceled():
 				break
 
-			cur.execute(self.sql["c_subset_view"].format(p))
+			cur.execute(self.sql["c_view"].format(p))
 			cur.execute(self.sql["c_triangles"].format(p))
-			#cur.execute("SELECT RecoverGeometryColumn('triangles_sel', 'triangle', {}, 'POLYGON', 'XY');".format(epsg_inuse.split(":")[1]))
-			#cur.execute("SELECT CreateSpatialIndex('triangles_sel', 'triangle');")
-			#cur.execute(sql_dinters)
+			cur.executescript(self.sql["recover_spatial"].format(table = "triangles_sel", column = "triangle", crs = srid, geometrytype = "POLYGON"))
 			cur.execute(self.sql["i_subset_res"])
-			cur.executescript(self.sql["d_subset_t"])
-			#cur.execute(sql_dtriint)
+			cur.executescript("""DROP TABLE triangles_sel; DROP VIEW poi_sel;""")
 			
 			progress_percent = (p/float(n_poi))*100
 			feedback.setProgress(progress_percent)
@@ -382,7 +402,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		
 		# recover spatial column in named_sqlite
 		cur = con_n.cursor()
-		cur.executescript(self.sql["recover_spatial"].format("'pol_res'", "'geom'", epsg_inuse.split(":")[1]))
+		cur.executescript(self.sql["recover_spatial"].format(table = "pol_res", column = "geom", crs = srid, geometrytype = "MULTIPOLYGON"))
 		cur.close()
 		
 		con_n.close()
@@ -390,7 +410,7 @@ class AggPolyAlgorithm(QgsProcessingAlgorithm):
 		
 		# create result-QgsVectorLayer 
 		named_sqlite_result_uri = QgsDataSourceUri()
-		named_sqlite_result_uri.setDatabase(named_sqlite_uri)
+		named_sqlite_result_uri.setDatabase(named_sqlite_path)
 		named_sqlite_result_uri.setDataSource('', 'pol_res', 'geom')
 		named_sqlite_result = QgsVectorLayer(named_sqlite_result_uri.uri(), providerLib='spatialite')
 

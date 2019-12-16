@@ -8,7 +8,7 @@ qgisMinimumVersion=3.0
 description=Aggregation of polygons within a certain distance and taking barriers into account.
 version=0.1
 author=Friedrich Viedt
-email=***REMOVED***
+email=57571099+fiedt@users.noreply.github.com
 
 about=Aggregation of polygons within a certain distance and taking barriers into account.
 
